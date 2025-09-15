@@ -321,6 +321,20 @@ public:
     }
 };
 
+static bool IsInterestingContentType(const std::string& ct)
+{
+    if (ct.empty()) return false;
+    std::string lower = ct;
+    for (auto& c : lower) c = (char)tolower(c);
+
+    return (lower.find("json") != std::string::npos ||
+        lower.find("xml") != std::string::npos ||
+        lower.find("grpc") != std::string::npos ||
+        lower.find("x-www-form-urlencoded") != std::string::npos ||
+        lower.find("form") != std::string::npos ||   // covers multipart/form-data
+        lower.find("soap") != std::string::npos);
+}
+
 // ------------------- Request Module -------------------
 class CollectorModule : public CHttpModule
 {
@@ -552,6 +566,22 @@ public:
             // Insert as escaped string
             out << "\"responseHeaders\":\"" << JsonEscape(respHdrs.str()) << "\",";
 
+            std::string reqContentType = "";
+            if (pRawReq && pRawReq->Headers.KnownHeaders[HttpHeaderContentType].RawValueLength > 0) {
+                reqContentType = CharBufToString(
+                    pRawReq->Headers.KnownHeaders[HttpHeaderContentType].pRawValue,
+                    pRawReq->Headers.KnownHeaders[HttpHeaderContentType].RawValueLength
+                );
+            }
+
+            std::string respContentType = "";
+            if (pRawResp && pRawResp->Headers.KnownHeaders[HttpHeaderContentType].RawValueLength > 0) {
+                respContentType = CharBufToString(
+                    pRawResp->Headers.KnownHeaders[HttpHeaderContentType].pRawValue,
+                    pRawResp->Headers.KnownHeaders[HttpHeaderContentType].RawValueLength
+                );
+            }
+
             // Request payload - try to get from our storage or entity chunks
             std::string reqBody = "";
 
@@ -697,9 +727,16 @@ public:
 
             out << "} ] }";
 
-            // Only forward successful (2xx) or redirect (3xx) responses
+            // Only forward if:
+            //   - statusCode is 2xx or 3xx
+            //   - AND request/response Content-Type matches interesting types
             if (code >= 200 && code < 400) {
-                if (gPoster) gPoster->Enqueue(out.str());
+                if (IsInterestingContentType(reqContentType) || IsInterestingContentType(respContentType)) {
+                    if (gPoster) gPoster->Enqueue(out.str());
+                }
+                else {
+                    SafeLog("Skipping request due to Content-Type filter. ReqCT=" + reqContentType + " RespCT=" + respContentType);
+                }
             }
             else {
                 SafeLog("Skipping request with statusCode " + std::to_string(code));
