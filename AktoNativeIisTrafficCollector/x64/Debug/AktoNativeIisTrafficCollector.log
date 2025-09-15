@@ -1,0 +1,4 @@
+﻿  Module.cpp
+     Creating library C:\Users\tangobee\source\repos\AktoNativeIisTrafficCollector\x64\Debug\AktoNativeIisTrafficCollector.lib and object C:\Users\tangobee\source\repos\AktoNativeIisTrafficCollector\x64\Debug\AktoNativeIisTrafficCollector.exp
+AktoNativeIisTrafficCollector.exp : warning LNK4070: /OUT:IISCollector.dll directive in .EXP differs from output filename 'C:\Users\tangobee\source\repos\AktoNativeIisTrafficCollector\x64\Debug\AktoNativeIisTrafficCollector.dll'; ignoring directive
+  AktoNativeIisTrafficCollector.vcxproj -> C:\Users\tangobee\source\repos\AktoNativeIisTrafficCollector\x64\Debug\AktoNativeIisTrafficCollector.dll
