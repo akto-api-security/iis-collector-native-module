@@ -730,17 +730,17 @@ public:
             // Only forward if:
             //   - statusCode is 2xx or 3xx
             //   - AND request/response Content-Type matches interesting types
-            if (code >= 200 && code < 400) {
+            // if (code >= 200 && code < 400) {
                 if (IsInterestingContentType(reqContentType) || IsInterestingContentType(respContentType)) {
                     if (gPoster) gPoster->Enqueue(out.str());
                 }
                 else {
                     SafeLog("Skipping request due to Content-Type filter. ReqCT=" + reqContentType + " RespCT=" + respContentType);
                 }
-            }
-            else {
-                SafeLog("Skipping request with statusCode " + std::to_string(code));
-            }
+            // }
+            // else {
+            //     SafeLog("Skipping request with statusCode " + std::to_string(code));
+            // }
 
         }
         catch (const std::exception& ex) {
