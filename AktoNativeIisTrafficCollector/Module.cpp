@@ -58,6 +58,7 @@ static void SafeLog(const std::string& msg)
 
 // ------------------- Config loader -------------------
 static std::wstring gBackendUrl;
+static size_t gMaxQueueSize = 5000;  // Default value
 
 static void LoadConfig()
 {
@@ -89,7 +90,37 @@ static void LoadConfig()
                     std::wstring wurl(wlen, 0);
                     MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, &wurl[0], wlen);
                     gBackendUrl = wurl;
-                    SafeLog("Loaded backendUrl from config: " + url);
+                }
+            }
+        }
+
+        // Parse "maxQueueSize": number
+        pos = content.find("\"maxQueueSize\"");
+        if (pos != std::string::npos) {
+            pos = content.find(':', pos);
+            if (pos != std::string::npos) {
+                // Skip whitespace
+                while (pos < content.length() && (content[pos] == ':' || content[pos] == ' ' || content[pos] == '\t')) {
+                    pos++;
+                }
+                // Extract number
+                size_t end = pos;
+                while (end < content.length() && isdigit(content[end])) {
+                    end++;
+                }
+                if (end > pos) {
+                    std::string queueSizeStr = content.substr(pos, end - pos);
+                    try {
+                        size_t queueSize = std::stoull(queueSizeStr);
+                        if (queueSize > 0) {
+                            gMaxQueueSize = queueSize;
+                        } else {
+                            SafeLog("WARNING: Invalid maxQueueSize in config (must be > 0), using default: " + std::to_string(gMaxQueueSize));
+                        }
+                    }
+                    catch (...) {
+                        SafeLog("WARNING: Failed to parse maxQueueSize, using default: " + std::to_string(gMaxQueueSize));
+                    }
                 }
             }
         }
@@ -162,6 +193,10 @@ public:
 
     void Enqueue(std::string json) {
         std::lock_guard<std::mutex> lk(mu_);
+        if (queue_.size() >= gMaxQueueSize) {
+            SafeLog("WARNING: Queue full (size=" + std::to_string(queue_.size()) + "), dropping oldest message");
+            queue_.pop();  // Remove oldest to make room
+        }
         queue_.push(std::move(json));
         cv_.notify_one();
     }
@@ -196,11 +231,11 @@ private:
             comps.dwExtraInfoLength = (DWORD)-1;
 
             if (gBackendUrl.empty()) {
-                SafeLog("Backend URL not configured");
+                SafeLog("ERROR: Backend URL not configured");
                 return;
             }
             if (!WinHttpCrackUrl(gBackendUrl.c_str(), (DWORD)gBackendUrl.size(), 0, &comps)) {
-                SafeLog("Failed to parse backendUrl");
+                SafeLog("ERROR: Failed to parse backendUrl");
                 return;
             }
 
@@ -230,14 +265,34 @@ private:
             std::wstring hdrs = L"Content-Type: application/json\r\n";
             BOOL sent = WinHttpSendRequest(hRequest, hdrs.c_str(), (DWORD)-1,
                 (LPVOID)json.data(), (DWORD)json.size(), (DWORD)json.size(), 0);
-            if (sent) WinHttpReceiveResponse(hRequest, NULL);
+
+            if (sent) {
+                BOOL received = WinHttpReceiveResponse(hRequest, NULL);
+                if (received) {
+                    DWORD statusCode = 0;
+                    DWORD statusCodeSize = sizeof(statusCode);
+                    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        NULL, &statusCode, &statusCodeSize, NULL);
+
+                    if (statusCode >= 200 && statusCode < 300) {
+                        SafeLog("SUCCESS: Data sent to backend (HTTP " + std::to_string(statusCode) + ")");
+                    } else {
+                        SafeLog("ERROR: Backend returned HTTP " + std::to_string(statusCode));
+                    }
+                } else {
+                    SafeLog("ERROR: Failed to receive response from backend");
+                }
+            } else {
+                DWORD error = GetLastError();
+                SafeLog("ERROR: Failed to send data to backend (WinHTTP error: " + std::to_string(error) + ")");
+            }
 
             WinHttpCloseHandle(hRequest);
             WinHttpCloseHandle(hConnect);
             WinHttpCloseHandle(hSession);
         }
         catch (...) {
-            SafeLog("Exception in PostJson");
+            SafeLog("ERROR: Exception in PostJson");
         }
     }
 
@@ -310,7 +365,7 @@ public:
             }
         }
         catch (...) {
-            SafeLog("Exception in OnGlobalPreBeginRequest");
+            SafeLog("ERROR: Exception in OnGlobalPreBeginRequest");
         }
 
         return GL_NOTIFICATION_CONTINUE;
@@ -424,7 +479,6 @@ public:
                             std::string originalPath = CharBufToString(uh.pRawValue, uh.RawValueLength);
                             if (!originalPath.empty()) {
                                 path = originalPath;
-                                SafeLog("Found original path in header " + headerName + ": " + path);
                                 break;
                             }
                         }
@@ -436,9 +490,6 @@ public:
             if (!queryString.empty()) {
                 path += "?" + queryString;
             }
-
-            // Log for debugging
-            SafeLog("Final extracted path: " + path + (isIISNode ? " (iisnode detected)" : ""));
 
             out << "\"path\":\"" << JsonEscape(path) << "\",";
 
@@ -734,20 +785,14 @@ public:
                 if (IsInterestingContentType(reqContentType) || IsInterestingContentType(respContentType)) {
                     if (gPoster) gPoster->Enqueue(out.str());
                 }
-                else {
-                    SafeLog("Skipping request due to Content-Type filter. ReqCT=" + reqContentType + " RespCT=" + respContentType);
-                }
-            // }
-            // else {
-            //     SafeLog("Skipping request with statusCode " + std::to_string(code));
             // }
 
         }
         catch (const std::exception& ex) {
-            SafeLog(std::string("Exception in OnSendResponse (batchData JSON): ") + ex.what());
+            SafeLog(std::string("ERROR: Exception in OnSendResponse: ") + ex.what());
         }
         catch (...) {
-            SafeLog("Unknown exception in OnSendResponse (batchData JSON)");
+            SafeLog("ERROR: Unknown exception in OnSendResponse");
         }
 
         return RQ_NOTIFICATION_CONTINUE;
@@ -790,11 +835,11 @@ extern "C" HRESULT __stdcall RegisterModule(DWORD, IHttpModuleRegistrationInfo* 
         return hr;
     }
     catch (const std::exception& ex) {
-        SafeLog(std::string("Exception in RegisterModule: ") + ex.what());
+        SafeLog(std::string("ERROR: Exception in RegisterModule: ") + ex.what());
         return E_FAIL;
     }
     catch (...) {
-        SafeLog("Unknown exception in RegisterModule");
+        SafeLog("ERROR: Unknown exception in RegisterModule");
         return E_FAIL;
     }
 }
