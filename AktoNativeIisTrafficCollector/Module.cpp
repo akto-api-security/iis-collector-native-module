@@ -333,48 +333,10 @@ struct RequestBodyStorage {
 
 static RequestBodyStorage gBodyStorage;
 
-// ------------------- Global Module for body capture -------------------
+// ------------------- Global Module (kept for future use if needed) -------------------
 class CollectorGlobalModule : public CGlobalModule
 {
 public:
-    GLOBAL_NOTIFICATION_STATUS
-        OnGlobalPreBeginRequest(IPreBeginRequestProvider* pProvider) override
-    {
-        try {
-            IHttpContext* pHttpContext = pProvider->GetHttpContext();
-            if (pHttpContext && pHttpContext->GetRequest()) {
-                IHttpRequest* pRequest = pHttpContext->GetRequest();
-                HTTP_REQUEST* pRawReq = pRequest->GetRawHttpRequest();
-
-                // Only capture body for POST/PUT/PATCH requests
-                if (pRawReq && (pRawReq->Verb == HttpVerbPOST || pRawReq->Verb == HttpVerbPUT)) {
-                    std::string body;
-
-                    // Try to get from entity chunks (often available here)
-                    if (pRawReq->EntityChunkCount > 0 && pRawReq->pEntityChunks) {
-                        for (USHORT i = 0; i < pRawReq->EntityChunkCount; ++i) {
-                            HTTP_DATA_CHUNK& chunk = pRawReq->pEntityChunks[i];
-                            if (chunk.DataChunkType == HttpDataChunkFromMemory &&
-                                chunk.FromMemory.pBuffer && chunk.FromMemory.BufferLength > 0) {
-                                body.append((const char*)chunk.FromMemory.pBuffer, chunk.FromMemory.BufferLength);
-                            }
-                        }
-                    }
-
-                    // Store the body if we got it
-                    if (!body.empty()) {
-                        gBodyStorage.Store(pRawReq->RequestId, body);
-                    }
-                }
-            }
-        }
-        catch (...) {
-            SafeLog("ERROR: Exception in OnGlobalPreBeginRequest");
-        }
-
-        return GL_NOTIFICATION_CONTINUE;
-    }
-
     void Terminate() override {
         delete this;
     }
@@ -399,6 +361,91 @@ class CollectorModule : public CHttpModule
 {
 public:
     REQUEST_NOTIFICATION_STATUS
+        OnBeginRequest(IHttpContext* pHttpContext, IHttpEventProvider* /*pProvider*/) override
+    {
+        try {
+            if (!pHttpContext || !pHttpContext->GetRequest()) return RQ_NOTIFICATION_CONTINUE;
+
+            IHttpRequest* pRequest = pHttpContext->GetRequest();
+            HTTP_REQUEST* pRawReq = pRequest->GetRawHttpRequest();
+
+            if (!pRawReq) return RQ_NOTIFICATION_CONTINUE;
+
+            // Check if this request might have a body
+            bool shouldCaptureBody = false;
+            shouldCaptureBody = (pRawReq->Verb == HttpVerbPOST ||
+                                pRawReq->Verb == HttpVerbPUT ||
+                                pRawReq->Verb == HttpVerbDELETE);
+
+            // Also check for PATCH as unknown verb
+            if (pRawReq->Verb == HttpVerbUnknown && pRawReq->pUnknownVerb && pRawReq->UnknownVerbLength > 0) {
+                std::string verb = CharBufToString(pRawReq->pUnknownVerb, pRawReq->UnknownVerbLength);
+                if (_stricmp(verb.c_str(), "PATCH") == 0) {
+                    shouldCaptureBody = true;
+                }
+            }
+
+            if (!shouldCaptureBody) return RQ_NOTIFICATION_CONTINUE;
+
+            std::string body;
+
+            // Read entity body in chunks
+            const DWORD CHUNK_SIZE = 4096;
+            DWORD cbRead = 0;
+            BOOL fMoreData = TRUE;
+
+            while (fMoreData) {
+                BYTE buffer[CHUNK_SIZE];
+                cbRead = 0;
+
+                HRESULT hr = pRequest->ReadEntityBody(buffer, CHUNK_SIZE, FALSE, &cbRead, &fMoreData);
+
+                if (FAILED(hr)) {
+                    // Handle specific errors
+                    if (hr == ERROR_HANDLE_EOF) {
+                        // No more data to read
+                        break;
+                    }
+                    SafeLog("WARNING: ReadEntityBody failed with HRESULT: 0x" +
+                           std::to_string(hr) + " for RequestId: " +
+                           std::to_string(pRawReq->RequestId));
+                    break;
+                }
+
+                if (cbRead > 0) {
+                    body.append((const char*)buffer, cbRead);
+                }
+
+                if (!fMoreData || cbRead == 0) {
+                    break;
+                }
+
+                // Safety limit: don't read more than 10MB
+                if (body.size() > 10 * 1024 * 1024) {
+                    SafeLog("WARNING: Request body exceeds 10MB, truncating");
+                    break;
+                }
+            }
+
+            // Store the body if we got anything
+            if (!body.empty()) {
+                gBodyStorage.Store(pRawReq->RequestId, body);
+                SafeLog("Captured request body for RequestId: " +
+                       std::to_string(pRawReq->RequestId) +
+                       " Size: " + std::to_string(body.size()) + " bytes");
+            }
+        }
+        catch (const std::exception& ex) {
+            SafeLog(std::string("ERROR: Exception in OnBeginRequest: ") + ex.what());
+        }
+        catch (...) {
+            SafeLog("ERROR: Unknown exception in OnBeginRequest");
+        }
+
+        return RQ_NOTIFICATION_CONTINUE;
+    }
+
+    REQUEST_NOTIFICATION_STATUS
         OnSendResponse(IHttpContext* pHttpContext, ISendResponseProvider* /*pProvider*/) override
     {
         try {
@@ -413,63 +460,21 @@ public:
             std::ostringstream out;
             out << "{ \"batchData\": [ {";
 
-            // Path extraction - for iisnode, we need to look for the original path
+            // Path extraction
             std::string path = "";
             std::string queryString = "";
 
-            // For iisnode, check if this is a node_app.js request and look for the actual path
-            bool isIISNode = false;
-
-            // First get the raw URL
+            // Get the raw URL
             if (pRawReq && pRawReq->pRawUrl && pRawReq->RawUrlLength > 0) {
                 std::string rawUrl = CharBufToString(pRawReq->pRawUrl, pRawReq->RawUrlLength);
 
-                // Check if this looks like an iisnode request
-                if (rawUrl.find("/node_app.js") != std::string::npos ||
-                    rawUrl.find(".js/") != std::string::npos) {
-                    isIISNode = true;
-
-                    // For iisnode, the actual path might be after the .js file
-                    // e.g., /node_app.js/submit or /app.js/api/users
-                    size_t jsPos = rawUrl.find(".js");
-                    if (jsPos != std::string::npos) {
-                        size_t pathStart = jsPos + 3; // Skip ".js"
-                        if (pathStart < rawUrl.length()) {
-                            // Extract everything after .js as the actual path
-                            std::string actualPath = rawUrl.substr(pathStart);
-
-                            // Handle query string
-                            size_t queryPos = actualPath.find('?');
-                            if (queryPos != std::string::npos) {
-                                path = actualPath.substr(0, queryPos);
-                                queryString = actualPath.substr(queryPos + 1);
-                            }
-                            else {
-                                path = actualPath;
-                            }
-
-                            // If path is empty, default to "/"
-                            if (path.empty()) {
-                                path = "/";
-                            }
-                        }
-                        else {
-                            // No path after .js, so it's the root
-                            path = "/";
-                        }
-                    }
+                size_t queryPos = rawUrl.find('?');
+                if (queryPos != std::string::npos) {
+                    path = rawUrl.substr(0, queryPos);
+                    queryString = rawUrl.substr(queryPos + 1);
                 }
-
-                // If not iisnode or couldn't extract, use the raw URL as-is
-                if (!isIISNode || path.empty()) {
-                    size_t queryPos = rawUrl.find('?');
-                    if (queryPos != std::string::npos) {
-                        path = rawUrl.substr(0, queryPos);
-                        queryString = rawUrl.substr(queryPos + 1);
-                    }
-                    else {
-                        path = rawUrl;
-                    }
+                else {
+                    path = rawUrl;
                 }
             }
 
@@ -640,22 +645,10 @@ public:
                 );
             }
 
-            // Request payload - try to get from our storage or entity chunks
+            // Request payload - retrieve from our storage (captured in OnBeginRequest)
             std::string reqBody = "";
-
-            // First try to get from our global storage
             if (pRawReq) {
                 reqBody = gBodyStorage.Retrieve(pRawReq->RequestId);
-            }
-
-            // If not in storage, try to get from entity chunks
-            if (reqBody.empty() && pRawReq && pRawReq->EntityChunkCount > 0 && pRawReq->pEntityChunks) {
-                for (USHORT i = 0; i < pRawReq->EntityChunkCount; ++i) {
-                    HTTP_DATA_CHUNK& chunk = pRawReq->pEntityChunks[i];
-                    if (chunk.DataChunkType == HttpDataChunkFromMemory && chunk.FromMemory.pBuffer && chunk.FromMemory.BufferLength > 0) {
-                        reqBody += CharBufToString((const char*)chunk.FromMemory.pBuffer, chunk.FromMemory.BufferLength);
-                    }
-                }
             }
 
             out << "\"requestPayload\":\"" << JsonEscape(reqBody) << "\",";
@@ -825,17 +818,9 @@ extern "C" HRESULT __stdcall RegisterModule(DWORD, IHttpModuleRegistrationInfo *
 
         if (!gPoster) gPoster.reset(new Poster());
 
-        // Register global module
-        CollectorGlobalModule* pGlobalModule = new CollectorGlobalModule();
-        HRESULT hr = pModuleInfo->SetGlobalNotifications(pGlobalModule, GL_PRE_BEGIN_REQUEST);
-        if (FAILED(hr)) {
-            delete pGlobalModule;
-            return hr;
-        }
-
-        // Register request module
+        // Register request module for both BEGIN_REQUEST and SEND_RESPONSE
         CollectorFactory* pFactory = new CollectorFactory();
-        hr = pModuleInfo->SetRequestNotifications(pFactory, RQ_SEND_RESPONSE, 0);
+        HRESULT hr = pModuleInfo->SetRequestNotifications(pFactory, RQ_BEGIN_REQUEST | RQ_SEND_RESPONSE, 0);
         if (FAILED(hr)) {
             delete pFactory;
         }
