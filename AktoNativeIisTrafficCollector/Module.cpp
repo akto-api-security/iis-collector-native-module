@@ -119,7 +119,7 @@ static void SafeLog(const std::string& msg, LogLevel level = LogLevel::INFO)
 // ------------------- Config loader -------------------
 static std::wstring gBackendUrl;
 static size_t gMaxQueueSize = 5000;  // Default value
-static size_t gMinPayloadSize = 0;  // Default: capture all sizes (0 = no minimum)
+static size_t gMaxPayloadSize = 0;  // Default: capture all sizes (0 = no maximum)
 
 static void LoadConfig()
 {
@@ -216,8 +216,8 @@ static void LoadConfig()
             }
         }
 
-        // Parse "minPayloadSize": number (in bytes)
-        pos = content.find("\"minPayloadSize\"");
+        // Parse "maxPayloadSize": number (in bytes)
+        pos = content.find("\"maxPayloadSize\"");
         if (pos != std::string::npos) {
             pos = content.find(':', pos);
             if (pos != std::string::npos) {
@@ -231,14 +231,14 @@ static void LoadConfig()
                     end++;
                 }
                 if (end > pos) {
-                    std::string minSizeStr = content.substr(pos, end - pos);
+                    std::string maxSizeStr = content.substr(pos, end - pos);
                     try {
-                        size_t minSize = std::stoull(minSizeStr);
-                        gMinPayloadSize = minSize;
-                        SafeLog("Minimum payload size set to: " + std::to_string(gMinPayloadSize) + " bytes", LogLevel::INFO);
+                        size_t maxSize = std::stoull(maxSizeStr);
+                        gMaxPayloadSize = maxSize;
+                        SafeLog("Maximum payload size set to: " + std::to_string(gMaxPayloadSize) + " bytes", LogLevel::INFO);
                     }
                     catch (...) {
-                        SafeLog("Failed to parse minPayloadSize, using default: " + std::to_string(gMinPayloadSize), LogLevel::WARNING);
+                        SafeLog("Failed to parse maxPayloadSize, using default: " + std::to_string(gMaxPayloadSize), LogLevel::WARNING);
                     }
                 }
             }
@@ -962,11 +962,11 @@ public:
             // Calculate total payload size (request + response)
             size_t totalPayloadSize = reqBody.size() + respBody.size();
 
-            // Check if payload size meets minimum threshold
-            if (gMinPayloadSize > 0 && totalPayloadSize < gMinPayloadSize) {
+            // Check if payload size exceeds maximum threshold
+            if (gMaxPayloadSize > 0 && totalPayloadSize > gMaxPayloadSize) {
                 SafeLog("Skipping traffic for " + path + " - payload size " +
-                       std::to_string(totalPayloadSize) + " bytes is below minimum " +
-                       std::to_string(gMinPayloadSize) + " bytes", LogLevel::DEBUG);
+                       std::to_string(totalPayloadSize) + " bytes exceeds maximum " +
+                       std::to_string(gMaxPayloadSize) + " bytes", LogLevel::DEBUG);
                 return RQ_NOTIFICATION_CONTINUE;
             }
 
