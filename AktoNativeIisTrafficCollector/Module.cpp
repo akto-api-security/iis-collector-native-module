@@ -27,7 +27,7 @@
 // ------------------- Logging helper -------------------
 enum class LogLevel {
     NONE = 0,
-    ERROR = 1,
+    ERR = 1,
     WARNING = 2,
     INFO = 3,
     DEBUG = 4
@@ -38,8 +38,8 @@ static LogLevel gLogLevel = LogLevel::INFO;  // Default log level
 static void SafeLog(const std::string& msg, LogLevel level = LogLevel::INFO)
 {
     try {
-        // Skip logging if level is below threshold
-        if (level > gLogLevel || gLogLevel == LogLevel::NONE) {
+        // Skip logging if we're at NONE or message level is higher (less important) than threshold
+        if (gLogLevel == LogLevel::NONE || level > gLogLevel) {
             return;
         }
 
@@ -53,7 +53,7 @@ static void SafeLog(const std::string& msg, LogLevel level = LogLevel::INFO)
         // Add log level prefix
         const char* levelStr = "";
         switch (level) {
-            case LogLevel::ERROR:   levelStr = "[ERROR] "; break;
+            case LogLevel::ERR:     levelStr = "[ERROR] "; break;
             case LogLevel::WARNING: levelStr = "[WARN]  "; break;
             case LogLevel::INFO:    levelStr = "[INFO]  "; break;
             case LogLevel::DEBUG:   levelStr = "[DEBUG] "; break;
@@ -61,8 +61,27 @@ static void SafeLog(const std::string& msg, LogLevel level = LogLevel::INFO)
         }
 
         std::string folder = "C:\\akto_configs\\logs\\";
-        CreateDirectoryA("C:\\akto_configs", nullptr);
-        CreateDirectoryA(folder.c_str(), nullptr);
+
+        // Try to create directories with error checking
+        DWORD attr = GetFileAttributesA("C:\\akto_configs");
+        if (attr == INVALID_FILE_ATTRIBUTES) {
+            if (!CreateDirectoryA("C:\\akto_configs", nullptr)) {
+                DWORD err = GetLastError();
+                if (err != ERROR_ALREADY_EXISTS) {
+                    return; // Can't create directory
+                }
+            }
+        }
+
+        attr = GetFileAttributesA(folder.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES) {
+            if (!CreateDirectoryA(folder.c_str(), nullptr)) {
+                DWORD err = GetLastError();
+                if (err != ERROR_ALREADY_EXISTS) {
+                    return; // Can't create directory
+                }
+            }
+        }
 
         std::ostringstream filename;
         filename << folder
@@ -74,6 +93,22 @@ static void SafeLog(const std::string& msg, LogLevel level = LogLevel::INFO)
         std::ofstream f(filename.str(), std::ios::app);
         if (f.is_open()) {
             f << buf << levelStr << msg << "\n";
+            f.flush(); // Force write to disk
+            f.close();
+        }
+        else {
+            // Fallback to Windows Event Log if file logging fails
+            HANDLE hEventLog = RegisterEventSourceA(NULL, "AktoIISCollector");
+            if (hEventLog) {
+                std::string eventMsg = std::string(levelStr) + msg;
+                const char* msgs[] = { eventMsg.c_str() };
+                WORD eventType = EVENTLOG_INFORMATION_TYPE;
+                if (level == LogLevel::ERR) eventType = EVENTLOG_ERROR_TYPE;
+                else if (level == LogLevel::WARNING) eventType = EVENTLOG_WARNING_TYPE;
+
+                ReportEventA(hEventLog, eventType, 0, 0, NULL, 1, 0, msgs, NULL);
+                DeregisterEventSource(hEventLog);
+            }
         }
     }
     catch (...) {
@@ -84,19 +119,20 @@ static void SafeLog(const std::string& msg, LogLevel level = LogLevel::INFO)
 // ------------------- Config loader -------------------
 static std::wstring gBackendUrl;
 static size_t gMaxQueueSize = 5000;  // Default value
+static size_t gMinPayloadSize = 0;  // Default: capture all sizes (0 = no minimum)
 
 static void LoadConfig()
 {
     try {
         std::string configPath = "C:\\akto_configs\\config.json";
         if (!PathFileExistsA(configPath.c_str())) {
-            SafeLog("Config file not found: " + configPath);
+            SafeLog("Config file not found: " + configPath, LogLevel::WARNING);
             return;
         }
 
         std::ifstream f(configPath);
         if (!f.is_open()) {
-            SafeLog("Unable to open config.json");
+            SafeLog("Unable to open config.json", LogLevel::ERR);
             return;
         }
 
@@ -141,11 +177,11 @@ static void LoadConfig()
                             gMaxQueueSize = queueSize;
                         }
                         else {
-                            SafeLog("WARNING: Invalid maxQueueSize in config (must be > 0), using default: " + std::to_string(gMaxQueueSize));
+                            SafeLog("Invalid maxQueueSize in config (must be > 0), using default: " + std::to_string(gMaxQueueSize), LogLevel::WARNING);
                         }
                     }
                     catch (...) {
-                        SafeLog("WARNING: Failed to parse maxQueueSize, using default: " + std::to_string(gMaxQueueSize));
+                        SafeLog("Failed to parse maxQueueSize, using default: " + std::to_string(gMaxQueueSize), LogLevel::WARNING);
                     }
                 }
             }
@@ -165,8 +201,8 @@ static void LoadConfig()
 
                     if (logLevelStr == "NONE") {
                         gLogLevel = LogLevel::NONE;
-                    } else if (logLevelStr == "ERROR") {
-                        gLogLevel = LogLevel::ERROR;
+                    } else if (logLevelStr == "ERROR" || logLevelStr == "ERR") {
+                        gLogLevel = LogLevel::ERR;
                     } else if (logLevelStr == "WARNING" || logLevelStr == "WARN") {
                         gLogLevel = LogLevel::WARNING;
                     } else if (logLevelStr == "INFO") {
@@ -174,17 +210,45 @@ static void LoadConfig()
                     } else if (logLevelStr == "DEBUG") {
                         gLogLevel = LogLevel::DEBUG;
                     } else {
-                        SafeLog("WARNING: Invalid logLevel in config (\"" + logLevelStr + "\"), using default: INFO");
+                        SafeLog("Invalid logLevel in config (\"" + logLevelStr + "\"), using default: INFO", LogLevel::WARNING);
+                    }
+                }
+            }
+        }
+
+        // Parse "minPayloadSize": number (in bytes)
+        pos = content.find("\"minPayloadSize\"");
+        if (pos != std::string::npos) {
+            pos = content.find(':', pos);
+            if (pos != std::string::npos) {
+                // Skip whitespace
+                while (pos < content.length() && (content[pos] == ':' || content[pos] == ' ' || content[pos] == '\t')) {
+                    pos++;
+                }
+                // Extract number
+                size_t end = pos;
+                while (end < content.length() && isdigit(content[end])) {
+                    end++;
+                }
+                if (end > pos) {
+                    std::string minSizeStr = content.substr(pos, end - pos);
+                    try {
+                        size_t minSize = std::stoull(minSizeStr);
+                        gMinPayloadSize = minSize;
+                        SafeLog("Minimum payload size set to: " + std::to_string(gMinPayloadSize) + " bytes", LogLevel::INFO);
+                    }
+                    catch (...) {
+                        SafeLog("Failed to parse minPayloadSize, using default: " + std::to_string(gMinPayloadSize), LogLevel::WARNING);
                     }
                 }
             }
         }
     }
     catch (const std::exception& ex) {
-        SafeLog(std::string("Exception in LoadConfig: ") + ex.what());
+        SafeLog(std::string("Exception in LoadConfig: ") + ex.what(), LogLevel::ERR);
     }
     catch (...) {
-        SafeLog("Unknown exception in LoadConfig");
+        SafeLog("Unknown exception in LoadConfig", LogLevel::ERR);
     }
 }
 
@@ -249,7 +313,7 @@ public:
     void Enqueue(std::string json) {
         std::lock_guard<std::mutex> lk(mu_);
         if (queue_.size() >= gMaxQueueSize) {
-            SafeLog("WARNING: Queue full (size=" + std::to_string(queue_.size()) + "), dropping oldest message");
+            SafeLog("Queue full (size=" + std::to_string(queue_.size()) + "), dropping oldest message", LogLevel::WARNING);
             queue_.pop();  // Remove oldest to make room
         }
         queue_.push(std::move(json));
@@ -286,11 +350,11 @@ private:
             comps.dwExtraInfoLength = (DWORD)-1;
 
             if (gBackendUrl.empty()) {
-                SafeLog("ERROR: Backend URL not configured");
+                SafeLog("Backend URL not configured", LogLevel::ERR);
                 return;
             }
             if (!WinHttpCrackUrl(gBackendUrl.c_str(), (DWORD)gBackendUrl.size(), 0, &comps)) {
-                SafeLog("ERROR: Failed to parse backendUrl");
+                SafeLog("Failed to parse backendUrl", LogLevel::ERR);
                 return;
             }
 
@@ -330,19 +394,19 @@ private:
                         NULL, &statusCode, &statusCodeSize, NULL);
 
                     if (statusCode >= 200 && statusCode < 300) {
-                        SafeLog("SUCCESS: Data sent to backend (HTTP " + std::to_string(statusCode) + ")");
+                        SafeLog("Data sent to backend (HTTP " + std::to_string(statusCode) + ")", LogLevel::DEBUG);
                     }
                     else {
-                        SafeLog("ERROR: Backend returned HTTP " + std::to_string(statusCode));
+                        SafeLog("Backend returned HTTP " + std::to_string(statusCode), LogLevel::ERR);
                     }
                 }
                 else {
-                    SafeLog("ERROR: Failed to receive response from backend");
+                    SafeLog("Failed to receive response from backend", LogLevel::ERR);
                 }
             }
             else {
                 DWORD error = GetLastError();
-                SafeLog("ERROR: Failed to send data to backend (WinHTTP error: " + std::to_string(error) + ")");
+                SafeLog("Failed to send data to backend (WinHTTP error: " + std::to_string(error) + ")", LogLevel::ERR);
             }
 
             WinHttpCloseHandle(hRequest);
@@ -350,7 +414,7 @@ private:
             WinHttpCloseHandle(hSession);
         }
         catch (...) {
-            SafeLog("ERROR: Exception in PostJson");
+            SafeLog("Exception in PostJson", LogLevel::ERR);
         }
     }
 
@@ -366,9 +430,9 @@ static std::unique_ptr<Poster> gPoster;
 // ------------------- Storage for request bodies -------------------
 struct RequestBodyStorage {
     std::mutex mu;
-    std::map<HTTP_REQUEST_ID, std::string> bodies;
+    std::map<HTTP_REQUEST_ID, std::shared_ptr<std::string>> bodies;
 
-    void Store(HTTP_REQUEST_ID id, const std::string& body) {
+    void Store(HTTP_REQUEST_ID id, std::shared_ptr<std::string> body) {
         std::lock_guard<std::mutex> lk(mu);
         bodies[id] = body;
     }
@@ -377,7 +441,7 @@ struct RequestBodyStorage {
         std::lock_guard<std::mutex> lk(mu);
         auto it = bodies.find(id);
         if (it != bodies.end()) {
-            std::string result = it->second;
+            std::string result = *(it->second);
             bodies.erase(it);
             return result;
         }
@@ -387,10 +451,68 @@ struct RequestBodyStorage {
 
 static RequestBodyStorage gBodyStorage;
 
-// ------------------- Global Module (kept for future use if needed) -------------------
+// ------------------- Global Module for body capture -------------------
 class CollectorGlobalModule : public CGlobalModule
 {
 public:
+    GLOBAL_NOTIFICATION_STATUS
+        OnGlobalPreBeginRequest(IPreBeginRequestProvider* pProvider) override
+    {
+        try {
+            IHttpContext* pHttpContext = pProvider->GetHttpContext();
+            if (pHttpContext && pHttpContext->GetRequest()) {
+                IHttpRequest* pRequest = pHttpContext->GetRequest();
+                HTTP_REQUEST* pRawReq = pRequest->GetRawHttpRequest();
+
+                // Determine if this request might have a body
+                bool shouldCaptureBody = false;
+                if (pRawReq) {
+                    // Capture body for POST, PUT, DELETE
+                    shouldCaptureBody = (pRawReq->Verb == HttpVerbPOST ||
+                                        pRawReq->Verb == HttpVerbPUT ||
+                                        pRawReq->Verb == HttpVerbDELETE);
+
+                    // Also check for PATCH as unknown verb
+                    if (pRawReq->Verb == HttpVerbUnknown && pRawReq->pUnknownVerb && pRawReq->UnknownVerbLength > 0) {
+                        std::string verb = CharBufToString(pRawReq->pUnknownVerb, pRawReq->UnknownVerbLength);
+                        if (_stricmp(verb.c_str(), "PATCH") == 0) {
+                            shouldCaptureBody = true;
+                        }
+                    }
+                }
+
+                if (shouldCaptureBody) {
+                    std::string body;
+
+                    // Try to get from entity chunks (often available here)
+                    if (pRawReq->EntityChunkCount > 0 && pRawReq->pEntityChunks) {
+                        for (USHORT i = 0; i < pRawReq->EntityChunkCount; ++i) {
+                            HTTP_DATA_CHUNK& chunk = pRawReq->pEntityChunks[i];
+                            if (chunk.DataChunkType == HttpDataChunkFromMemory &&
+                                chunk.FromMemory.pBuffer && chunk.FromMemory.BufferLength > 0) {
+                                body.append((const char*)chunk.FromMemory.pBuffer, chunk.FromMemory.BufferLength);
+                            }
+                        }
+                    }
+
+                    // Store the body if we got it
+                    if (!body.empty()) {
+                        auto bodyPtr = std::make_shared<std::string>(body);
+                        gBodyStorage.Store(pRawReq->RequestId, bodyPtr);
+                        SafeLog("Captured request body (PreBegin) for RequestId: " +
+                               std::to_string(pRawReq->RequestId) +
+                               " Size: " + std::to_string(body.size()) + " bytes", LogLevel::DEBUG);
+                    }
+                }
+            }
+        }
+        catch (...) {
+            SafeLog("Exception in OnGlobalPreBeginRequest", LogLevel::ERR);
+        }
+
+        return GL_NOTIFICATION_CONTINUE;
+    }
+
     void Terminate() override {
         delete this;
     }
@@ -441,7 +563,7 @@ public:
 
             if (!shouldCaptureBody) return RQ_NOTIFICATION_CONTINUE;
 
-            std::string body;
+            auto bodyPtr = std::make_shared<std::string>();
 
             // Read entity body in chunks
             const DWORD CHUNK_SIZE = 4096;
@@ -456,18 +578,18 @@ public:
 
                 if (FAILED(hr)) {
                     // Handle specific errors
-                    if (hr == ERROR_HANDLE_EOF) {
+                    if (hr == ERROR_HANDLE_EOF || hr == HRESULT_FROM_WIN32(ERROR_HANDLE_EOF)) {
                         // No more data to read
                         break;
                     }
-                    SafeLog("WARNING: ReadEntityBody failed with HRESULT: 0x" +
+                    SafeLog("ReadEntityBody failed with HRESULT: 0x" +
                            std::to_string(hr) + " for RequestId: " +
-                           std::to_string(pRawReq->RequestId));
+                           std::to_string(pRawReq->RequestId), LogLevel::WARNING);
                     break;
                 }
 
                 if (cbRead > 0) {
-                    body.append((const char*)buffer, cbRead);
+                    bodyPtr->append((const char*)buffer, cbRead);
                 }
 
                 if (!fMoreData || cbRead == 0) {
@@ -475,25 +597,30 @@ public:
                 }
 
                 // Safety limit: don't read more than 10MB
-                if (body.size() > 10 * 1024 * 1024) {
-                    SafeLog("WARNING: Request body exceeds 10MB, truncating");
+                if (bodyPtr->size() > 10 * 1024 * 1024) {
+                    SafeLog("Request body exceeds 10MB, truncating", LogLevel::WARNING);
                     break;
                 }
             }
 
-            // Store the body if we got anything
-            if (!body.empty()) {
-                gBodyStorage.Store(pRawReq->RequestId, body);
-                SafeLog("Captured request body for RequestId: " +
+            // Store the captured body and re-insert it
+            if (!bodyPtr->empty()) {
+                SafeLog("Captured request body (BeginRequest) for RequestId: " +
                        std::to_string(pRawReq->RequestId) +
-                       " Size: " + std::to_string(body.size()) + " bytes");
+                       " Size: " + std::to_string(bodyPtr->size()) + " bytes", LogLevel::DEBUG);
+
+                // Store for later retrieval
+                gBodyStorage.Store(pRawReq->RequestId, bodyPtr);
+
+                // Re-insert the body so the application can still read it
+                pRequest->InsertEntityBody((void*)bodyPtr->data(), (DWORD)bodyPtr->size());
             }
         }
         catch (const std::exception& ex) {
-            SafeLog(std::string("ERROR: Exception in OnBeginRequest: ") + ex.what());
+            SafeLog(std::string("Exception in OnBeginRequest: ") + ex.what(), LogLevel::ERR);
         }
         catch (...) {
-            SafeLog("ERROR: Unknown exception in OnBeginRequest");
+            SafeLog("Unknown exception in OnBeginRequest", LogLevel::ERR);
         }
 
         return RQ_NOTIFICATION_CONTINUE;
@@ -832,21 +959,34 @@ public:
 
             out << "} ] }";
 
+            // Calculate total payload size (request + response)
+            size_t totalPayloadSize = reqBody.size() + respBody.size();
+
+            // Check if payload size meets minimum threshold
+            if (gMinPayloadSize > 0 && totalPayloadSize < gMinPayloadSize) {
+                SafeLog("Skipping traffic for " + path + " - payload size " +
+                       std::to_string(totalPayloadSize) + " bytes is below minimum " +
+                       std::to_string(gMinPayloadSize) + " bytes", LogLevel::DEBUG);
+                return RQ_NOTIFICATION_CONTINUE;
+            }
+
             // Only forward if:
             //   - statusCode is 2xx or 3xx
             //   - AND request/response Content-Type matches interesting types
             // if (code >= 200 && code < 400) {
             if (IsInterestingContentType(reqContentType) || IsInterestingContentType(respContentType)) {
+                SafeLog("Sending traffic to backend for " + path + " - payload size: " +
+                       std::to_string(totalPayloadSize) + " bytes", LogLevel::DEBUG);
                 if (gPoster) gPoster->Enqueue(out.str());
             }
             // }
 
         }
         catch (const std::exception& ex) {
-            SafeLog(std::string("ERROR: Exception in OnSendResponse: ") + ex.what());
+            SafeLog(std::string("Exception in OnSendResponse: ") + ex.what(), LogLevel::ERR);
         }
         catch (...) {
-            SafeLog("ERROR: Unknown exception in OnSendResponse");
+            SafeLog("Unknown exception in OnSendResponse", LogLevel::ERR);
         }
 
         return RQ_NOTIFICATION_CONTINUE;
@@ -868,24 +1008,38 @@ public:
 extern "C" HRESULT __stdcall RegisterModule(DWORD, IHttpModuleRegistrationInfo * pModuleInfo, IHttpServer * pGlobalInfo) {
     if (!pModuleInfo || !pGlobalInfo) return E_POINTER;
     try {
+        // Force initial log to verify logging is working
+        SafeLog("=== IIS Traffic Collector Module Starting ===", LogLevel::INFO);
+
         LoadConfig();
+
+        SafeLog("Config loaded. Backend URL configured: " + std::string(gBackendUrl.empty() ? "NO" : "YES"), LogLevel::INFO);
+        SafeLog("Log level: " + std::to_string((int)gLogLevel), LogLevel::INFO);
 
         if (!gPoster) gPoster.reset(new Poster());
 
+        // Register global module
+        CollectorGlobalModule* pGlobalModule = new CollectorGlobalModule();
+        HRESULT hr = pModuleInfo->SetGlobalNotifications(pGlobalModule, GL_PRE_BEGIN_REQUEST);
+        if (FAILED(hr)) {
+            delete pGlobalModule;
+            return hr;
+        }
+
         // Register request module for both BEGIN_REQUEST and SEND_RESPONSE
         CollectorFactory* pFactory = new CollectorFactory();
-        HRESULT hr = pModuleInfo->SetRequestNotifications(pFactory, RQ_BEGIN_REQUEST | RQ_SEND_RESPONSE, 0);
+        hr = pModuleInfo->SetRequestNotifications(pFactory, RQ_BEGIN_REQUEST | RQ_SEND_RESPONSE, 0);
         if (FAILED(hr)) {
             delete pFactory;
         }
         return hr;
     }
     catch (const std::exception& ex) {
-        SafeLog(std::string("ERROR: Exception in RegisterModule: ") + ex.what());
+        SafeLog(std::string("Exception in RegisterModule: ") + ex.what(), LogLevel::ERR);
         return E_FAIL;
     }
     catch (...) {
-        SafeLog("ERROR: Unknown exception in RegisterModule");
+        SafeLog("Unknown exception in RegisterModule", LogLevel::ERR);
         return E_FAIL;
     }
 }
