@@ -25,15 +25,40 @@
 #pragma comment(lib, "ws2_32.lib")
 
 // ------------------- Logging helper -------------------
-static void SafeLog(const std::string& msg)
+enum class LogLevel {
+    NONE = 0,
+    ERROR = 1,
+    WARNING = 2,
+    INFO = 3,
+    DEBUG = 4
+};
+
+static LogLevel gLogLevel = LogLevel::INFO;  // Default log level
+
+static void SafeLog(const std::string& msg, LogLevel level = LogLevel::INFO)
 {
     try {
+        // Skip logging if level is below threshold
+        if (level > gLogLevel || gLogLevel == LogLevel::NONE) {
+            return;
+        }
+
         SYSTEMTIME st;
         GetLocalTime(&st);
 
         char buf[128];
         sprintf_s(buf, "%04d-%02d-%02d %02d:%02d:%02d.%03d ",
             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+        // Add log level prefix
+        const char* levelStr = "";
+        switch (level) {
+            case LogLevel::ERROR:   levelStr = "[ERROR] "; break;
+            case LogLevel::WARNING: levelStr = "[WARN]  "; break;
+            case LogLevel::INFO:    levelStr = "[INFO]  "; break;
+            case LogLevel::DEBUG:   levelStr = "[DEBUG] "; break;
+            default: levelStr = "[INFO]  "; break;
+        }
 
         std::string folder = "C:\\akto_configs\\logs\\";
         CreateDirectoryA("C:\\akto_configs", nullptr);
@@ -48,7 +73,7 @@ static void SafeLog(const std::string& msg)
 
         std::ofstream f(filename.str(), std::ios::app);
         if (f.is_open()) {
-            f << buf << msg << "\n";
+            f << buf << levelStr << msg << "\n";
         }
     }
     catch (...) {
@@ -121,6 +146,35 @@ static void LoadConfig()
                     }
                     catch (...) {
                         SafeLog("WARNING: Failed to parse maxQueueSize, using default: " + std::to_string(gMaxQueueSize));
+                    }
+                }
+            }
+        }
+
+        // Parse "logLevel": "ERROR"|"WARNING"|"INFO"|"DEBUG"|"NONE"
+        pos = content.find("\"logLevel\"");
+        if (pos != std::string::npos) {
+            pos = content.find(':', pos);
+            if (pos != std::string::npos) {
+                pos = content.find('"', pos);
+                size_t end = content.find('"', pos + 1);
+                if (pos != std::string::npos && end != std::string::npos) {
+                    std::string logLevelStr = content.substr(pos + 1, end - pos - 1);
+                    // Convert to uppercase for comparison
+                    for (auto& c : logLevelStr) c = (char)toupper(c);
+
+                    if (logLevelStr == "NONE") {
+                        gLogLevel = LogLevel::NONE;
+                    } else if (logLevelStr == "ERROR") {
+                        gLogLevel = LogLevel::ERROR;
+                    } else if (logLevelStr == "WARNING" || logLevelStr == "WARN") {
+                        gLogLevel = LogLevel::WARNING;
+                    } else if (logLevelStr == "INFO") {
+                        gLogLevel = LogLevel::INFO;
+                    } else if (logLevelStr == "DEBUG") {
+                        gLogLevel = LogLevel::DEBUG;
+                    } else {
+                        SafeLog("WARNING: Invalid logLevel in config (\"" + logLevelStr + "\"), using default: INFO");
                     }
                 }
             }
